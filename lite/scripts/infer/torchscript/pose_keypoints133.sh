@@ -1,27 +1,54 @@
 #!/bin/bash
 
+VIDEO_DIR=$1
+device_id=$2
+batchsize=$3
+jobs_per_gpu=$4
+
+#----------------------------check if the results already exist----------------------------------------------
+if [ -f "$VIDEO_DIR/sapiens_wholbody.pt" ]; then
+    echo "Sapiens results already exist at $VIDEO_DIR/sapiens_wholbody.pt"
+    exit 0
+fi
+
 cd ../../.. || exit
 SAPIENS_CHECKPOINT_ROOT=${SAPIENS_LITE_CHECKPOINT_ROOT}
 
 MODE='torchscript' ## original. no optimizations (slow). full precision inference.
 # MODE='bfloat16' ## A100 gpus. faster inference at bfloat16
+ENABLE_VIS=false
+CLEAN_FRAMES=false
 
 SAPIENS_CHECKPOINT_ROOT=$SAPIENS_CHECKPOINT_ROOT/$MODE
 
 #----------------------------set your input and output directories----------------------------------------------
-INPUT_VIDEO='/mnt/data/jing/Video_Generation/video_data_repos/video_smplx_labeling/sapiens/example_data1/two_persons.mp4'
-VIDEO_DIR=$(dirname "$INPUT_VIDEO")
-FILE_NAME=$(basename "$INPUT_VIDEO" .mp4)
+INPUT_VIDEO=$VIDEO_DIR/source_video.mp4
 FRAMES_DIR="${VIDEO_DIR}/frames"
 
 mkdir -p ${FRAMES_DIR}
 ffmpeg -i ${INPUT_VIDEO} ${FRAMES_DIR}/frame_%06d.jpg
 
 INPUT=${FRAMES_DIR}
-OUTPUT="${VIDEO_DIR}/${FILE_NAME}"
+OUTPUT=${VIDEO_DIR}
 
-# INPUT='/mnt/data/jing/Video_Generation/video_data_repos/video_smplx_labeling/sapiens/example_data3/images'
-# OUTPUT='/mnt/data/jing/Video_Generation/video_data_repos/video_smplx_labeling/sapiens/example_data3/results_pose133'
+##-------------------------------------preprocess-------------------------------------
+RUN_FILE='demo/tracker.py'
+DETECTION_CHECKPOINT=$SAPIENS_CHECKPOINT_ROOT/detector/checkpoints/yolo/yolov8x.pt
+
+TRACK_SAVE_PATH=${OUTPUT}/preprocess/bbx.pt
+
+if [ ! -f "$TRACK_SAVE_PATH" ]; then
+    CUDA_VISIBLE_DEVICES=${device_id} python ${RUN_FILE} \
+        --video_path ${INPUT_VIDEO} \
+        --save_path ${TRACK_SAVE_PATH} \
+        --frame_thres 0.5 \
+        --yolo_checkpoint ${DETECTION_CHECKPOINT}
+
+    echo "Tracking results saved to ${TRACK_SAVE_PATH}"
+else
+    echo "Tracking results already exist at ${TRACK_SAVE_PATH}"
+fi
+
 
 #--------------------------MODEL CARD---------------
 # MODEL_NAME='sapiens_0.3b'; CHECKPOINT=$SAPIENS_CHECKPOINT_ROOT/pose/checkpoints/sapiens_0.3b/sapiens_0.3b_coco_wholebody_best_coco_wholebody_AP_620_$MODE.pt2
@@ -29,24 +56,18 @@ OUTPUT="${VIDEO_DIR}/${FILE_NAME}"
 # MODEL_NAME='sapiens_1b'; CHECKPOINT=$SAPIENS_CHECKPOINT_ROOT/pose/checkpoints/sapiens_1b/sapiens_1b_coco_wholebody_best_coco_wholebody_AP_727_$MODE.pt2
 MODEL_NAME='sapiens_2b'; CHECKPOINT=$SAPIENS_CHECKPOINT_ROOT/pose/checkpoints/sapiens_2b/sapiens_2b_coco_wholebody_best_coco_wholebody_AP_745_$MODE.pt2
 
-OUTPUT=$OUTPUT/$MODEL_NAME
+KPTS_OUTPUT=$OUTPUT/$MODEL_NAME
 
-DETECTION_CONFIG_FILE='../pose/demo/mmdetection_cfg/rtmdet_m_640-8xb32_coco-person_no_nms.py'
-DETECTION_CHECKPOINT=$SAPIENS_CHECKPOINT_ROOT/detector/checkpoints/rtmpose/rtmdet_m_8xb32-100e_coco-obj365-person-235e8209.pth
-
-#---------------------------VISUALIZATION PARAMS--------------------------------------------------
-LINE_THICKNESS=1 ## line thickness of the skeleton
-RADIUS=2 ## keypoint radius
-KPT_THRES=0.3 ## confidence threshold
 
 ##-------------------------------------inference-------------------------------------
-RUN_FILE='demo/vis_pose.py'
+RUN_FILE='demo/infer_pose.py'
 
 ## number of inference jobs per gpu, total number of gpus and gpu ids
+## On our lambda machine, setting jobs x 2 is faster than batch_size x 2
 # JOBS_PER_GPU=1; TOTAL_GPUS=8; VALID_GPU_IDS=(0 1 2 3 4 5 6 7)
-JOBS_PER_GPU=2; TOTAL_GPUS=1; VALID_GPU_IDS=(7)
+JOBS_PER_GPU=$jobs_per_gpu; TOTAL_GPUS=1; VALID_GPU_IDS=($device_id)
 
-BATCH_SIZE=32
+BATCH_SIZE=$batchsize
 
 # Find all images and sort them, then write to a temporary text file
 IMAGE_LIST="${INPUT}/image_list.txt"
@@ -90,15 +111,10 @@ for ((i=0; i<TOTAL_JOBS; i++)); do
   GPU_ID=$((i % TOTAL_GPUS))
   CUDA_VISIBLE_DEVICES=${VALID_GPU_IDS[GPU_ID]} python ${RUN_FILE} \
     ${CHECKPOINT} \
-    --num_keypoints 133 \
-    --det-config ${DETECTION_CONFIG_FILE} \
-    --det-checkpoint ${DETECTION_CHECKPOINT} \
+    --track-result-path ${TRACK_SAVE_PATH} \
     --batch-size ${BATCH_SIZE} \
     --input "${INPUT}/image_paths_$((i+1)).txt" \
-    --output-root="${OUTPUT}" \
-    --radius ${RADIUS} \
-    --thickness ${LINE_THICKNESS} \
-    --kpt-thr ${KPT_THRES} & ## add & to process in background
+    --output-root="${KPTS_OUTPUT}" & ## add & to process in background
   # Allow a short delay between starting each job to reduce system load spikes
   sleep 1
 done
@@ -112,22 +128,44 @@ for ((i=0; i<TOTAL_JOBS; i++)); do
   rm "${INPUT}/image_paths_$((i+1)).txt"
 done
 
+echo "Kpts results saved to $KPTS_OUTPUT"
+
+##--------------------------------------CLEAN & VISUALIZATION----------------------------------
+LINE_THICKNESS=2 ## line thickness of the skeleton
+RADIUS=4 ## keypoint radius
+KPT_THRES=0.3 ## confidence threshold
+
+RUN_FILE='demo/infer_pose_cleaner.py'
+KPTS_SAVE_PATH=${OUTPUT}/sapiens_wholebody.pt
+VIS_SAVE_PATH=${OUTPUT}/sapiens_kpts_visualization.mp4
+
+PYTHON_CMD="python ${RUN_FILE} \
+    --video_path ${INPUT_VIDEO} \
+    --keypoints_folder ${KPTS_OUTPUT} \
+    --save_path ${KPTS_SAVE_PATH} \
+    --output_video_path ${VIS_SAVE_PATH} \
+    --num_keypoints 133 \
+    --kpt_thr ${KPT_THRES} \
+    --radius ${RADIUS} \
+    --thickness ${LINE_THICKNESS}"
+
+if ${ENABLE_VIS}; then
+    PYTHON_CMD="$PYTHON_CMD --enable_vis"
+fi
+
+$PYTHON_CMD
+
+echo "Merged kpts results saved to ${KPTS_SAVE_PATH}"
+if ${ENABLE_VIS}; then
+    echo "Visualization results saved to ${VIS_SAVE_PATH}"
+fi
+
+# Delete the FRAMES_DIR
+if ${CLEAN_FRAMES}; then
+    rm -rf ${FRAMES_DIR}
+fi
+
 # Go back to the original script's directory
 cd -
 
-echo "Processing complete."
-echo "Results saved to $OUTPUT"
-
-# Get the frame rate from the input video
-INPUT_FPS=$(ffprobe -v error -select_streams v -of default=noprint_wrappers=1:nokey=1 -show_entries stream=r_frame_rate "${INPUT_VIDEO}")
-# Convert fraction to decimal if necessary
-INPUT_FPS=$(echo "scale=2; $INPUT_FPS" | bc)
-
-# Merge the saved visualization frames into a video through ffmpeg
-if [ -d "${OUTPUT}" ]; then
-    echo "Merging visualization frames into a video..."
-    ffmpeg -framerate ${INPUT_FPS} -pattern_type glob -i "${OUTPUT}/*.jpg" -c:v libx264 -pix_fmt yuv420p "${VIDEO_DIR}/visualization.mp4"
-    echo "Video saved as ${VIDEO_DIR}/visualization.mp4"
-else
-    echo "No visualization frames found. Skipping video creation."
-fi
+echo "Sapiens wholebody keypoints processing complete."

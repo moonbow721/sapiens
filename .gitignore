@@ -14,3 +14,9 @@ __pycache__/
 *.DS_Store
 *._*
 *.egg
+*.pth
+*.pt2
+*.pt
+example_data1/
+example_data2/
+example_data3/
